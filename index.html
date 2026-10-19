@@ -177,7 +177,7 @@ const CONTROL_NAMES = {
   0x00c3: "Gesture button",
   0x00c4: "SmartShift (wheel mode)",
   0x00d7: "Virtual control",
-  0x01a0: "Haptic sense panel (unconfirmed)",
+  0x01a0: "Haptic sense panel",
 };
 
 const SWIPE_THRESHOLD = 60;   // raw XY counts before a hold counts as a swipe
@@ -576,9 +576,9 @@ async function showFeatures() {
     setControlsEnabled(false);
     return;
   }
-  tbody.innerHTML = "";
   try {
     const rows = await listFeatures(deviceIndex);
+    tbody.innerHTML = "";
     for (const r of rows) {
       const tr = document.createElement("tr");
       const name = FEATURE_NAMES[r.id] || "Unknown";
