@@ -59,6 +59,10 @@
   #status { padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
   #status.ok { border-color: var(--ok); }
   #status.bad { border-color: var(--bad); }
+  .battery { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; }
+  .meter { width: 10rem; height: .9rem; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); overflow: hidden; }
+  #batteryFill { height: 100%; width: 0; background: var(--ok); transition: width .3s; }
+  #batteryFill.low { background: var(--bad); }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; background: var(--surface); border: 1px solid var(--line); }
   th, td { text-align: left; padding: .45rem .75rem; border-bottom: 1px solid var(--line); font-size: .92rem; }
@@ -78,9 +82,25 @@
   <div class="row">
     <button id="connect" class="primary">Connect mouse</button>
     <button id="features" disabled>List features</button>
+    <button id="buttons" disabled>List buttons</button>
   </div>
 
   <div id="status" role="status">Not connected.</div>
+
+  <h2>Battery</h2>
+  <div class="battery">
+    <div class="meter" aria-hidden="true"><div id="batteryFill"></div></div>
+    <span id="batteryText" class="muted">Connect to read the battery.</span>
+    <button id="batteryRefresh" disabled>Refresh</button>
+  </div>
+
+  <h2>Buttons</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Control</th><th>CID</th><th>Can divert</th><th>Currently</th></tr></thead>
+      <tbody id="buttonRows"><tr><td colspan="4" class="muted">Connect, then choose “List buttons.”</td></tr></tbody>
+    </table>
+  </div>
 
   <h2>Features on this device</h2>
   <div class="scroll">
@@ -108,17 +128,43 @@ const FEATURE_NAMES = {
   0x0001: "Feature set",
   0x0003: "Device firmware info",
   0x0005: "Device name",
+  0x0007: "Device friendly name",
+  0x0020: "Config change",
+  0x0021: "Unique random ID",
   0x1000: "Battery status",
   0x1004: "Unified battery",
+  0x1602: "Password authentication",
+  0x1802: "Device reset",
+  0x1805: "OOB state",
   0x1814: "Change host",
   0x1815: "Hosts info",
   0x1b04: "Reprogrammable controls v4 (button remap)",
   0x1d4b: "Wireless device status",
+  0x1e00: "Enable hidden features",
   0x2110: "SmartShift",
   0x2111: "SmartShift enhanced",
   0x2121: "Hi-res wheel",
+  0x2150: "Thumb wheel",
   0x2201: "Adjustable DPI",
+  0x2250: "XY stats",
+  0x2251: "Wheel stats",
 };
+
+// Control IDs (CIDs) from reprogrammable controls v4. Unlisted ones show as hex.
+const CONTROL_NAMES = {
+  0x0050: "Left click",
+  0x0051: "Right click",
+  0x0052: "Middle click",
+  0x0053: "Back",
+  0x0056: "Forward",
+  0x005b: "Wheel tilt left",
+  0x005d: "Wheel tilt right",
+  0x00c3: "Gesture button",
+  0x00c4: "SmartShift (wheel mode)",
+};
+
+const BATTERY_LEVELS = { 8: "Full", 4: "Good", 2: "Low", 1: "Critical" };
+const CHARGING = ["Discharging", "Charging", "Charging (slow)", "Fully charged", "Charging error"];
 
 const $ = (id) => document.getElementById(id);
 const hex = (n, w = 2) => "0x" + n.toString(16).padStart(w, "0");
@@ -126,6 +172,7 @@ const hex = (n, w = 2) => "0x" + n.toString(16).padStart(w, "0");
 let device = null;
 let deviceIndex = null;
 let pending = [];
+let featureCache = new Map();   // feature ID -> feature index on this device
 
 function log(msg) {
   const el = $("log");
@@ -148,7 +195,10 @@ function onInputReport(event) {
     (data[1] === 0xff && data[2] === p.feature && data[3] === p.funcSw) || // HID++ 2.0 error
     (data[1] === 0x8f && data[2] === p.feature && data[3] === p.funcSw)    // HID++ 1.0 error
   ));
-  if (!entry) return;
+  if (!entry) {
+    onEvent(data);
+    return;
+  }
   pending = pending.filter((p) => p !== entry);
   clearTimeout(entry.timer);
   if (data[1] === 0xff || data[1] === 0x8f) {
@@ -193,6 +243,13 @@ async function getFeatureIndex(index, featureId) {
   return r[3] === 0 && featureId !== 0 ? null : r[3];
 }
 
+async function featureIndex(featureId) {
+  if (!featureCache.has(featureId)) {
+    featureCache.set(featureId, await getFeatureIndex(deviceIndex, featureId));
+  }
+  return featureCache.get(featureId);
+}
+
 async function readName(index) {
   const f = await getFeatureIndex(index, 0x0005);
   if (f == null) return null;
@@ -220,6 +277,114 @@ async function listFeatures(index) {
     rows.push({ index: i, id: (r[3] << 8) | r[4] });
   }
   return rows;
+}
+
+/* ---------- battery (0x1004 unified battery) ---------- */
+
+// Status layout (reply or event): [percent, level flags, charging, external power]
+function showBattery(percent, levelFlags, charging) {
+  const level = [8, 4, 2, 1].find((bit) => levelFlags & bit);
+  const parts = [];
+  if (percent > 0) parts.push(percent + "%");
+  else if (level) parts.push(BATTERY_LEVELS[level]);
+  parts.push(CHARGING[charging] || "Unknown state " + charging);
+  $("batteryText").textContent = parts.join(" · ");
+  $("batteryText").className = "";
+  const fill = $("batteryFill");
+  const width = percent > 0 ? percent : { 8: 100, 4: 60, 2: 20, 1: 5 }[level] || 0;
+  fill.style.width = width + "%";
+  fill.classList.toggle("low", level === 2 || level === 1);
+}
+
+async function readBattery() {
+  try {
+    const f = await featureIndex(0x1004);
+    if (f == null) {
+      $("batteryText").textContent = "This device has no unified battery feature.";
+      return;
+    }
+    const r = await request(deviceIndex, f, 1); // get_status
+    showBattery(r[3], r[4], r[5]);
+    log("Battery: " + r[3] + "%, level " + hex(r[4]) + ", charging " + r[5]);
+  } catch (err) {
+    log("Battery read failed: " + err.message);
+    $("batteryText").textContent = "Could not read the battery: " + err.message;
+  }
+}
+
+// Unsolicited reports from the device (software ID 0). Battery changes arrive here.
+function onEvent(data) {
+  if (data[0] !== deviceIndex || (data[2] & 0x0f) !== 0) return;
+  if (featureCache.get(0x1004) === data[1] && data[2] >> 4 === 0) {
+    showBattery(data[3], data[4], data[5]);
+  }
+}
+
+/* ---------- buttons (0x1b04 reprogrammable controls v4) ---------- */
+
+async function listButtons() {
+  const f = await featureIndex(0x1b04);
+  if (f == null) throw new Error("reprogrammable controls v4 not supported");
+  const count = (await request(deviceIndex, f, 0))[3];
+  const controls = [];
+  for (let i = 0; i < count; i++) {
+    // getCidInfo: [cid hi, cid lo, task hi, task lo, flags, position, group, group mask, extra flags]
+    const r = await request(deviceIndex, f, 1, [i]);
+    const cid = (r[3] << 8) | r[4];
+    const flags = r[7];
+    const extra = r[11];
+    // getCidReporting: [cid hi, cid lo, reporting flags, remap hi, remap lo, extra flags]
+    const rep = await request(deviceIndex, f, 2, [cid >> 8, cid & 0xff]);
+    controls.push({
+      cid,
+      position: r[8],
+      divertable: !!(flags & 0x20),
+      persistable: !!(flags & 0x40),
+      virtual: !!(flags & 0x80),
+      rawXY: !!(extra & 0x01),
+      diverted: !!(rep[5] & 0x01),
+      persistDiverted: !!(rep[5] & 0x04),
+      remap: (rep[6] << 8) | rep[7],
+    });
+  }
+  return controls;
+}
+
+async function showButtons() {
+  const tbody = $("buttonRows");
+  tbody.innerHTML = "";
+  try {
+    const controls = await listButtons();
+    for (const c of controls) {
+      const can = [];
+      if (c.divertable) can.push("yes");
+      if (c.persistable) can.push("persistent");
+      if (c.rawXY) can.push("raw XY");
+      const now = [];
+      if (c.diverted) now.push("diverted");
+      if (c.persistDiverted) now.push("persistently diverted");
+      if (c.remap && c.remap !== c.cid) now.push("remapped to " + (CONTROL_NAMES[c.remap] || hex(c.remap, 4)));
+      const cells = [
+        (CONTROL_NAMES[c.cid] || "Unknown control") + (c.virtual ? " (virtual)" : ""),
+        hex(c.cid, 4),
+        can.join(", ") || "no",
+        now.join(", ") || "default",
+      ];
+      const tr = document.createElement("tr");
+      cells.forEach((text, i) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (i === 1) td.className = "id";
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+    log("Read " + controls.length + " controls.");
+  } catch (err) {
+    log("Button read failed: " + err.message);
+    tbody.innerHTML = "<tr><td colspan=\"4\"></td></tr>";
+    tbody.firstChild.firstChild.textContent = "Could not read buttons: " + err.message;
+  }
 }
 
 /* ---------- connect ---------- */
@@ -251,6 +416,7 @@ async function connect() {
     device.removeEventListener("inputreport", onInputReport);
     device.addEventListener("inputreport", onInputReport);
     pending = [];
+    featureCache = new Map();
     log("Opened " + device.productName + " (vendor " + hex(device.vendorId, 4) + ", product " + hex(device.productId, 4) + ")");
 
     deviceIndex = null;
@@ -273,7 +439,8 @@ async function connect() {
 
     const name = await readName(deviceIndex).catch(() => null);
     setStatus("Connected: " + (name || device.productName) + " (device index " + hex(deviceIndex) + ")", "ok");
-    $("features").disabled = false;
+    setControlsEnabled(true);
+    await readBattery();
   } catch (err) {
     setStatus("Could not connect: " + err.message, "bad");
     log("Error: " + err.message);
@@ -285,7 +452,7 @@ async function showFeatures() {
   if (!device || deviceIndex == null) {
     log("Not connected. Click Connect mouse first.");
     setStatus("Not connected.", "bad");
-    $("features").disabled = true;
+    setControlsEnabled(false);
     return;
   }
   tbody.innerHTML = "";
@@ -305,15 +472,22 @@ async function showFeatures() {
   }
 }
 
+function setControlsEnabled(on) {
+  for (const id of ["features", "buttons", "batteryRefresh"]) $(id).disabled = !on;
+}
+
 $("connect").addEventListener("click", connect);
 $("features").addEventListener("click", showFeatures);
+$("buttons").addEventListener("click", showButtons);
+$("batteryRefresh").addEventListener("click", readBattery);
 
 if ("hid" in navigator) {
   navigator.hid.addEventListener("disconnect", (e) => {
     if (e.device === device) {
       setStatus("Mouse disconnected.", "bad");
-      $("features").disabled = true;
+      setControlsEnabled(false);
       device = null;
+      deviceIndex = null;
     }
   });
 } else {
