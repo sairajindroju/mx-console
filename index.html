@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MX Master 4 console (unofficial)</title>
+<style>
+  :root {
+    --bg: #f6f7f8;
+    --surface: #ffffff;
+    --text: #16191d;
+    --muted: #5b6570;
+    --line: #d8dde2;
+    --accent: #0b6e8a;
+    --accent-text: #ffffff;
+    --ok: #1d7a46;
+    --bad: #b3261e;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101316;
+      --surface: #181c20;
+      --text: #e8ebee;
+      --muted: #97a1ab;
+      --line: #2a3036;
+      --accent: #4fb3cf;
+      --accent-text: #08262f;
+      --ok: #5fd08e;
+      --bad: #ff8a80;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .5rem; letter-spacing: -.01em; }
+  h2 { font-size: 1.05rem; margin: 2rem 0 .6rem; }
+  p { margin: 0 0 1rem; max-width: 62ch; }
+  .muted { color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1rem 0; }
+  button {
+    font: inherit;
+    padding: .6rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  #status { padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+  #status.ok { border-color: var(--ok); }
+  #status.bad { border-color: var(--bad); }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; background: var(--surface); border: 1px solid var(--line); }
+  th, td { text-align: left; padding: .45rem .75rem; border-bottom: 1px solid var(--line); font-size: .92rem; }
+  td.id { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  pre#log {
+    margin: 0; padding: .85rem 1rem; min-height: 8rem; max-height: 22rem; overflow: auto;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    font: .85rem/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>MX Master 4 console</h1>
+  <p class="muted">Unofficial and not affiliated with Logitech. This page talks to your mouse over WebHID using the publicly documented HID++ 2.0 protocol. Quit Logitech Options+ before connecting.</p>
+
+  <div class="row">
+    <button id="connect" class="primary">Connect mouse</button>
+    <button id="features" disabled>List features</button>
+  </div>
+
+  <div id="status" role="status">Not connected.</div>
+
+  <h2>Features on this device</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Index</th><th>Feature ID</th><th>Name</th></tr></thead>
+      <tbody id="featureRows"><tr><td colspan="3" class="muted">Connect, then choose “List features.”</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>Log</h2>
+  <pre id="log"></pre>
+</main>
+
+<script>
+"use strict";
+
+const LOGITECH = 0x046d;
+const SW_ID = 0x07;               // our software ID, echoed back in replies
+const LONG_REPORT = 0x11;         // HID++ 20-byte report (report ID + 19 bytes)
+const DIRECT_INDEX = 0xff;        // device index for Bluetooth / wired
+const RECEIVER_SLOTS = [1, 2, 3, 4, 5, 6]; // device indexes behind a Bolt receiver
+
+const FEATURE_NAMES = {
+  0x0000: "Root",
+  0x0001: "Feature set",
+  0x0003: "Device firmware info",
+  0x0005: "Device name",
+  0x1000: "Battery status",
+  0x1004: "Unified battery",
+  0x1814: "Change host",
+  0x1815: "Hosts info",
+  0x1b04: "Reprogrammable controls v4 (button remap)",
+  0x1d4b: "Wireless device status",
+  0x2110: "SmartShift",
+  0x2111: "SmartShift enhanced",
+  0x2121: "Hi-res wheel",
+  0x2201: "Adjustable DPI",
+};
+
+const $ = (id) => document.getElementById(id);
+const hex = (n, w = 2) => "0x" + n.toString(16).padStart(w, "0");
+
+let device = null;
+let deviceIndex = null;
+let pending = [];
+
+function log(msg) {
+  const el = $("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, kind) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = kind || "";
+}
+
+/* ---------- transport ---------- */
+
+function onInputReport(event) {
+  const data = new Uint8Array(event.data.buffer);
+  const entry = pending.find((p) => p.index === data[0] && (
+    (data[1] === p.feature && data[2] === p.funcSw) ||        // normal reply
+    (data[1] === 0xff && data[2] === p.feature && data[3] === p.funcSw) || // HID++ 2.0 error
+    (data[1] === 0x8f && data[2] === p.feature && data[3] === p.funcSw)    // HID++ 1.0 error
+  ));
+  if (!entry) return;
+  pending = pending.filter((p) => p !== entry);
+  clearTimeout(entry.timer);
+  if (data[1] === 0xff || data[1] === 0x8f) {
+    entry.reject(new Error("device error " + hex(data[4])));
+  } else {
+    entry.resolve(data);
+  }
+}
+
+// Sends one HID++ call and resolves with the reply bytes.
+// Reply layout: [deviceIndex, featureIndex, function|swId, ...params]
+function request(index, feature, func, params = [], timeout = 700) {
+  const funcSw = (func << 4) | SW_ID;
+  const payload = new Uint8Array(19);
+  payload.set([index, feature, funcSw, ...params]);
+  return new Promise((resolve, reject) => {
+    const entry = { index, feature, funcSw, resolve, reject };
+    entry.timer = setTimeout(() => {
+      pending = pending.filter((p) => p !== entry);
+      reject(new Error("timeout"));
+    }, timeout);
+    pending.push(entry);
+    device.sendReport(LONG_REPORT, payload).catch((err) => {
+      clearTimeout(entry.timer);
+      pending = pending.filter((p) => p !== entry);
+      reject(err);
+    });
+  });
+}
+
+/* ---------- HID++ 2.0 helpers ---------- */
+
+// Root feature (index 0), function 1: ping / protocol version.
+async function ping(index) {
+  const r = await request(index, 0x00, 1, [0, 0, 0xa5]);
+  return { major: r[3], minor: r[4] };
+}
+
+// Root feature, function 0: map a feature ID to this device’s feature index.
+async function getFeatureIndex(index, featureId) {
+  const r = await request(index, 0x00, 0, [featureId >> 8, featureId & 0xff]);
+  return r[3] === 0 && featureId !== 0 ? null : r[3];
+}
+
+async function readName(index) {
+  const f = await getFeatureIndex(index, 0x0005);
+  if (f == null) return null;
+  const len = (await request(index, f, 0))[3];
+  let name = "";
+  while (name.length < len) {
+    const r = await request(index, f, 1, [name.length]);
+    const before = name.length;
+    for (let i = 3; i < r.length && name.length < len; i++) {
+      if (r[i] === 0) break;
+      name += String.fromCharCode(r[i]);
+    }
+    if (name.length === before) break;
+  }
+  return name;
+}
+
+async function listFeatures(index) {
+  const fs = await getFeatureIndex(index, 0x0001);
+  if (fs == null) throw new Error("feature set not supported");
+  const count = (await request(index, fs, 0))[3];
+  const rows = [{ index: 0, id: 0x0000 }];
+  for (let i = 1; i <= count; i++) {
+    const r = await request(index, fs, 1, [i]);
+    rows.push({ index: i, id: (r[3] << 8) | r[4] });
+  }
+  return rows;
+}
+
+/* ---------- connect ---------- */
+
+async function connect() {
+  if (!("hid" in navigator)) {
+    setStatus("This browser does not support WebHID. Use Chrome or Edge on desktop.", "bad");
+    return;
+  }
+  try {
+    const picked = await navigator.hid.requestDevice({
+      filters: [
+        { vendorId: LOGITECH, usagePage: 0xff43 }, // Bluetooth / wired HID++ interface
+        { vendorId: LOGITECH, usagePage: 0xff00 }, // Bolt / Unifying receiver interface
+      ],
+    });
+    const found = picked.find((d) =>
+      d.collections.some((c) => c.outputReports.some((r) => r.reportId === LONG_REPORT))
+    );
+    if (!found) {
+      // Keep any existing connection; only report the problem.
+      log(picked.length ? "That entry has no HID++ long-report interface." : "No device selected.");
+      if (!device) setStatus("No usable HID++ interface selected. Try again and pick another entry.", "bad");
+      return;
+    }
+    if (device && device !== found) device.removeEventListener("inputreport", onInputReport);
+    device = found;
+    if (!device.opened) await device.open();
+    device.removeEventListener("inputreport", onInputReport);
+    device.addEventListener("inputreport", onInputReport);
+    pending = [];
+    log("Opened " + device.productName + " (vendor " + hex(device.vendorId, 4) + ", product " + hex(device.productId, 4) + ")");
+
+    deviceIndex = null;
+    for (const idx of [DIRECT_INDEX, ...RECEIVER_SLOTS]) {
+      try {
+        const v = await ping(idx);
+        if (v.major >= 2) {
+          deviceIndex = idx;
+          log("Index " + hex(idx) + ": HID++ " + v.major + "." + v.minor);
+          break;
+        }
+      } catch (e) {
+        log("Index " + hex(idx) + ": " + e.message);
+      }
+    }
+    if (deviceIndex == null) {
+      setStatus("Opened the interface, but no HID++ 2.0 device answered. Is the mouse awake and Options+ closed?", "bad");
+      return;
+    }
+
+    const name = await readName(deviceIndex).catch(() => null);
+    setStatus("Connected: " + (name || device.productName) + " (device index " + hex(deviceIndex) + ")", "ok");
+    $("features").disabled = false;
+  } catch (err) {
+    setStatus("Could not connect: " + err.message, "bad");
+    log("Error: " + err.message);
+  }
+}
+
+async function showFeatures() {
+  const tbody = $("featureRows");
+  if (!device || deviceIndex == null) {
+    log("Not connected. Click Connect mouse first.");
+    setStatus("Not connected.", "bad");
+    $("features").disabled = true;
+    return;
+  }
+  tbody.innerHTML = "";
+  try {
+    const rows = await listFeatures(deviceIndex);
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const name = FEATURE_NAMES[r.id] || "Unknown";
+      tr.innerHTML = "<td>" + r.index + "</td><td class=\"id\">" + hex(r.id, 4) + "</td><td></td>";
+      tr.lastChild.textContent = name;
+      tbody.appendChild(tr);
+    }
+    log("Read " + rows.length + " features.");
+  } catch (err) {
+    log("Feature read failed: " + err.message);
+    tbody.innerHTML = "<tr><td colspan=\"3\">Could not read features: " + err.message + "</td></tr>";
+  }
+}
+
+$("connect").addEventListener("click", connect);
+$("features").addEventListener("click", showFeatures);
+
+if ("hid" in navigator) {
+  navigator.hid.addEventListener("disconnect", (e) => {
+    if (e.device === device) {
+      setStatus("Mouse disconnected.", "bad");
+      $("features").disabled = true;
+      device = null;
+    }
+  });
+} else {
+  setStatus("This browser does not support WebHID. Use Chrome or Edge on desktop.", "bad");
+}
+</script>
+</body>
+</html>
