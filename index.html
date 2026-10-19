@@ -64,6 +64,10 @@
   #batteryFill { height: 100%; width: 0; background: var(--ok); transition: width .3s; }
   #batteryFill.low { background: var(--bad); }
   .scroll { overflow-x: auto; }
+  tr.held td { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  td button { padding: .25rem .7rem; font-size: .85rem; }
+  .live { display: grid; gap: .35rem; padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+  #held, #moved, #gesture { font-weight: 600; }
   table { border-collapse: collapse; width: 100%; background: var(--surface); border: 1px solid var(--line); }
   th, td { text-align: left; padding: .45rem .75rem; border-bottom: 1px solid var(--line); font-size: .92rem; }
   td.id { font-family: ui-monospace, Menlo, Consolas, monospace; }
@@ -95,11 +99,22 @@
   </div>
 
   <h2>Buttons</h2>
+  <p class="muted">“Watch” diverts a button to this page so its presses show up below, and the mouse stops doing that button’s normal action. “Restore” gives it back. Turning the mouse off and on also restores every button.</p>
+  <div class="row">
+    <button id="restoreAll" disabled>Restore all buttons</button>
+  </div>
   <div class="scroll">
     <table>
-      <thead><tr><th>Control</th><th>CID</th><th>Can divert</th><th>Currently</th></tr></thead>
-      <tbody id="buttonRows"><tr><td colspan="4" class="muted">Connect, then choose “List buttons.”</td></tr></tbody>
+      <thead><tr><th>Control</th><th>CID</th><th>Can divert</th><th>Currently</th><th></th></tr></thead>
+      <tbody id="buttonRows"><tr><td colspan="5" class="muted">Connect, then choose “List buttons.”</td></tr></tbody>
     </table>
+  </div>
+
+  <h2>Live presses</h2>
+  <div class="live">
+    <div><span class="muted">Held:</span> <span id="held">nothing</span></div>
+    <div><span class="muted">Movement while held:</span> <span id="moved">–</span></div>
+    <div><span class="muted">Last gesture:</span> <span id="gesture">–</span></div>
   </div>
 
   <h2>Features on this device</h2>
@@ -161,7 +176,11 @@ const CONTROL_NAMES = {
   0x005d: "Wheel tilt right",
   0x00c3: "Gesture button",
   0x00c4: "SmartShift (wheel mode)",
+  0x00d7: "Virtual control",
+  0x01a0: "Haptic sense panel (unconfirmed)",
 };
+
+const SWIPE_THRESHOLD = 60;   // raw XY counts before a hold counts as a swipe
 
 const BATTERY_LEVELS = { 8: "Full", 4: "Good", 2: "Low", 1: "Critical" };
 const CHARGING = ["Discharging", "Charging", "Charging (slow)", "Fully charged", "Charging error"];
@@ -173,6 +192,9 @@ let device = null;
 let deviceIndex = null;
 let pending = [];
 let featureCache = new Map();   // feature ID -> feature index on this device
+let controls = [];              // last result of listButtons()
+let held = [];                  // CIDs currently held (diverted buttons only)
+let move = { x: 0, y: 0 };      // raw movement since the first button went down
 
 function log(msg) {
   const el = $("log");
@@ -312,12 +334,97 @@ async function readBattery() {
   }
 }
 
-// Unsolicited reports from the device (software ID 0). Battery changes arrive here.
+// Unsolicited reports from the device (software ID 0): battery changes and diverted buttons.
 function onEvent(data) {
   if (data[0] !== deviceIndex || (data[2] & 0x0f) !== 0) return;
-  if (featureCache.get(0x1004) === data[1] && data[2] >> 4 === 0) {
+  const event = data[2] >> 4;
+  if (featureCache.get(0x1004) === data[1] && event === 0) {
     showBattery(data[3], data[4], data[5]);
+  } else if (featureCache.get(0x1b04) === data[1]) {
+    if (event === 0) onButtons(data);
+    else if (event === 1) onRawXY(data);
   }
+}
+
+/* ---------- live presses ---------- */
+
+const controlName = (cid) => CONTROL_NAMES[cid] || "Control " + hex(cid, 4);
+const int16 = (hi, lo) => (((hi << 8) | lo) << 16) >> 16;
+
+// divertedButtonsEvent: up to four held CIDs, two bytes each, zero-padded.
+function onButtons(data) {
+  const now = [];
+  for (let i = 3; i + 1 < 11; i += 2) {
+    const cid = (data[i] << 8) | data[i + 1];
+    if (cid) now.push(cid);
+  }
+  for (const cid of now) if (!held.includes(cid)) log("Pressed " + controlName(cid));
+  for (const cid of held) {
+    if (!now.includes(cid)) {
+      log("Released " + controlName(cid));
+      if (now.length === 0) finishGesture(cid);
+    }
+  }
+  if (held.length === 0 && now.length) {
+    move = { x: 0, y: 0 };
+    $("moved").textContent = "0, 0";
+  }
+  held = now;
+  $("held").textContent = held.length ? held.map(controlName).join(" + ") : "nothing";
+  for (const tr of $("buttonRows").querySelectorAll("tr[data-cid]")) {
+    tr.classList.toggle("held", held.includes(Number(tr.dataset.cid)));
+  }
+}
+
+// divertedRawMouseXYEvent: signed 16-bit dx, dy while a raw-XY-diverted button is held.
+function onRawXY(data) {
+  move.x += int16(data[3], data[4]);
+  move.y += int16(data[5], data[6]);
+  $("moved").textContent = move.x + ", " + move.y;
+}
+
+function finishGesture(cid) {
+  const { x, y } = move;
+  let kind = "click";
+  if (Math.max(Math.abs(x), Math.abs(y)) >= SWIPE_THRESHOLD) {
+    kind = Math.abs(x) > Math.abs(y) ? (x > 0 ? "swipe right" : "swipe left")
+                                      : (y > 0 ? "swipe down" : "swipe up");
+  }
+  $("gesture").textContent = controlName(cid) + ": " + kind;
+  log("Gesture: " + controlName(cid) + " " + kind + " (" + x + ", " + y + ")");
+}
+
+/* ---------- divert / restore ---------- */
+
+// setCidReporting flags: bit0 divert, bit1 divert valid, bit4 raw XY, bit5 raw XY valid.
+async function setDivert(cid, on, rawXY) {
+  const f = await featureIndex(0x1b04);
+  let flags = 0x02 | (on ? 0x01 : 0);
+  if (rawXY) flags |= 0x20 | (on ? 0x10 : 0);
+  await request(deviceIndex, f, 3, [cid >> 8, cid & 0xff, flags, 0, 0]);
+  log((on ? "Watching " : "Restored ") + controlName(cid));
+}
+
+async function toggleDivert(c) {
+  try {
+    await setDivert(c.cid, !c.diverted, c.rawXY);
+  } catch (err) {
+    log("Could not change " + controlName(c.cid) + ": " + err.message);
+  }
+  await showButtons();
+}
+
+async function restoreAll() {
+  if (!controls.length) await showButtons();
+  for (const c of controls) {
+    if (!c.divertable || (!c.diverted && !c.rawXYDiverted)) continue;
+    try {
+      await setDivert(c.cid, false, c.rawXY);
+    } catch (err) {
+      log("Could not restore " + controlName(c.cid) + ": " + err.message);
+    }
+  }
+  await showButtons();
 }
 
 /* ---------- buttons (0x1b04 reprogrammable controls v4) ---------- */
@@ -326,7 +433,7 @@ async function listButtons() {
   const f = await featureIndex(0x1b04);
   if (f == null) throw new Error("reprogrammable controls v4 not supported");
   const count = (await request(deviceIndex, f, 0))[3];
-  const controls = [];
+  const list = [];
   for (let i = 0; i < count; i++) {
     // getCidInfo: [cid hi, cid lo, task hi, task lo, flags, position, group, group mask, extra flags]
     const r = await request(deviceIndex, f, 1, [i]);
@@ -335,7 +442,7 @@ async function listButtons() {
     const extra = r[11];
     // getCidReporting: [cid hi, cid lo, reporting flags, remap hi, remap lo, extra flags]
     const rep = await request(deviceIndex, f, 2, [cid >> 8, cid & 0xff]);
-    controls.push({
+    list.push({
       cid,
       position: r[8],
       divertable: !!(flags & 0x20),
@@ -344,24 +451,25 @@ async function listButtons() {
       rawXY: !!(extra & 0x01),
       diverted: !!(rep[5] & 0x01),
       persistDiverted: !!(rep[5] & 0x04),
+      rawXYDiverted: !!(rep[5] & 0x10),
       remap: (rep[6] << 8) | rep[7],
     });
   }
-  return controls;
+  return list;
 }
 
 async function showButtons() {
   const tbody = $("buttonRows");
-  tbody.innerHTML = "";
   try {
-    const controls = await listButtons();
+    controls = await listButtons();
+    tbody.innerHTML = "";
     for (const c of controls) {
       const can = [];
       if (c.divertable) can.push("yes");
       if (c.persistable) can.push("persistent");
       if (c.rawXY) can.push("raw XY");
       const now = [];
-      if (c.diverted) now.push("diverted");
+      if (c.diverted) now.push(c.rawXYDiverted ? "diverted + movement" : "diverted");
       if (c.persistDiverted) now.push("persistently diverted");
       if (c.remap && c.remap !== c.cid) now.push("remapped to " + (CONTROL_NAMES[c.remap] || hex(c.remap, 4)));
       const cells = [
@@ -371,18 +479,28 @@ async function showButtons() {
         now.join(", ") || "default",
       ];
       const tr = document.createElement("tr");
+      tr.dataset.cid = c.cid;
+      tr.classList.toggle("held", held.includes(c.cid));
       cells.forEach((text, i) => {
         const td = document.createElement("td");
         td.textContent = text;
         if (i === 1) td.className = "id";
         tr.appendChild(td);
       });
+      const action = document.createElement("td");
+      if (c.divertable) {
+        const btn = document.createElement("button");
+        btn.textContent = c.diverted ? "Restore" : "Watch";
+        btn.addEventListener("click", () => toggleDivert(c));
+        action.appendChild(btn);
+      }
+      tr.appendChild(action);
       tbody.appendChild(tr);
     }
     log("Read " + controls.length + " controls.");
   } catch (err) {
     log("Button read failed: " + err.message);
-    tbody.innerHTML = "<tr><td colspan=\"4\"></td></tr>";
+    tbody.innerHTML = "<tr><td colspan=\"5\"></td></tr>";
     tbody.firstChild.firstChild.textContent = "Could not read buttons: " + err.message;
   }
 }
@@ -417,6 +535,8 @@ async function connect() {
     device.addEventListener("inputreport", onInputReport);
     pending = [];
     featureCache = new Map();
+    controls = [];
+    held = [];
     log("Opened " + device.productName + " (vendor " + hex(device.vendorId, 4) + ", product " + hex(device.productId, 4) + ")");
 
     deviceIndex = null;
@@ -441,6 +561,7 @@ async function connect() {
     setStatus("Connected: " + (name || device.productName) + " (device index " + hex(deviceIndex) + ")", "ok");
     setControlsEnabled(true);
     await readBattery();
+    await showButtons();   // also looks up 0x1b04 so button events are recognized
   } catch (err) {
     setStatus("Could not connect: " + err.message, "bad");
     log("Error: " + err.message);
@@ -473,13 +594,14 @@ async function showFeatures() {
 }
 
 function setControlsEnabled(on) {
-  for (const id of ["features", "buttons", "batteryRefresh"]) $(id).disabled = !on;
+  for (const id of ["features", "buttons", "batteryRefresh", "restoreAll"]) $(id).disabled = !on;
 }
 
 $("connect").addEventListener("click", connect);
 $("features").addEventListener("click", showFeatures);
 $("buttons").addEventListener("click", showButtons);
 $("batteryRefresh").addEventListener("click", readBattery);
+$("restoreAll").addEventListener("click", restoreAll);
 
 if ("hid" in navigator) {
   navigator.hid.addEventListener("disconnect", (e) => {
@@ -488,6 +610,8 @@ if ("hid" in navigator) {
       setControlsEnabled(false);
       device = null;
       deviceIndex = null;
+      held = [];
+      $("held").textContent = "nothing";
     }
   });
 } else {
